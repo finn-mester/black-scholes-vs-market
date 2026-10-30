@@ -5,3 +5,6 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 .DS_Store
+
+# Bloomberg data is licensed: keep exports out of the repository.
+data/bloomberg/
