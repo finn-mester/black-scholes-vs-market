@@ -122,7 +122,7 @@ A rerun replaces the saved outputs in the notebook, so do not commit one made wi
 pytest
 ```
 
-The 147 tests run in a few seconds, on synthetic data, with no network access.
+The 152 tests run in under a minute, on synthetic data, with no network access.
 
 ## Using your own data
 
