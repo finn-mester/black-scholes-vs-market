@@ -86,7 +86,7 @@ The evidence itself has limits:
 - **Delayed quotes.** Yahoo gives no exact time for each quote. The parity check removes the stale quotes it can detect, but it cannot show that the rest are simultaneous.
 - **Implied rates are not Treasury rates.** The 3-month implied rate is 52 bp above the 13-week T-bill yield of 3.97%. This is probably a funding spread, which this project did not test. The short-dated rate is also noisy.
 - **Crash risk is an interpretation.** The data shows the skew exists, but it does not separate crash risk from demand for hedging.
-- **The Bloomberg loader is untested on a real export.** It was tested only on synthetic files.
+- **Bloomberg CSV loader – tested on synthetic files only, not yet validated on a real terminal export.**
 
 ## Installation
 
@@ -122,26 +122,54 @@ A rerun replaces the saved outputs in the notebook, so do not commit one made wi
 pytest
 ```
 
-The 152 tests run in under a minute, on synthetic data, with no network access.
+The 179 tests run in under a minute, on synthetic data, with no network access.
 
 ## Using your own data
 
 ```python
 from bs_lab.market_data import build_smile, fetch_option_chain, load_bloomberg_csv, save_chain
 
-# Fresh quotes from Yahoo. Save them, because a chain cannot be downloaded again later.
+# Fresh quotes from Yahoo, during US market hours. Save them, because a chain
+# cannot be downloaded again later. git ignores CSV files in data/.
 quotes = fetch_option_chain("^SPX")
 save_chain(quotes, "data/spx_options_new.csv")
 
-# Or a Bloomberg export with one row per contract.
+# Or a Bloomberg export (format below).
 quotes = load_bloomberg_csv("data/bloomberg/spx.csv", quote_time="2026-10-30 15:00")
 
 smile = build_smile(quotes)
 ```
 
-Columns are matched on common Bloomberg names. Pass `column_map={"Your Header": "strike"}` for anything else. Keep exports in `data/bloomberg/`, which git ignores, because Bloomberg data is licensed.
-
 Run these from a Python session in the repository root with `src` on the path, for example `PYTHONPATH=src python`.
+
+### Bloomberg CSV format
+
+**Bloomberg CSV loader – tested on synthetic files only, not yet validated on a real terminal export.** The header names below are common spellings and have not been checked on a terminal. [`tests/fixtures/bloomberg_example.csv`](tests/fixtures/bloomberg_example.csv) shows the expected layout, on made-up prices.
+
+The file must be UTF-8 text, comma-separated, with the header on the first line and no title lines above it. It holds one underlying and one row per contract. A side-by-side OMON layout, with calls and puts on the same row, must first be reshaped.
+
+| Column | Accepted headers (any case) | Format | Required |
+|---|---|---|---|
+| Expiry | `Expiry`, `Exp`, `Expiration`, `Expiration Date`, `Expiry Date`, `OPT_EXPIRE_DT` | `MM/DD/YYYY`, `MM/DD/YY` or `YYYY-MM-DD` | Yes, or pass `expiry=` for a single-expiry file |
+| Strike | `Strike`, `Strike Px`, `Strike Price`, `OPT_STRIKE_PX` | `4500.00` or `4,500.00` | Yes |
+| Type | `Type`, `C/P`, `Call/Put`, `Put/Call`, `OPT_PUT_CALL` | `C`, `P`, `Call` or `Put` | Yes |
+| Bid | `Bid`, `Bid Price`, `PX_BID` | Number; blank, `N/A`, `#N/A` or `-` means no quote | Yes |
+| Ask | `Ask`, `Ask Price`, `Offer`, `PX_ASK` | Same as bid | Yes |
+| Last | `Last`, `Last Price`, `PX_LAST` | Number. Not used in the smile | No |
+| Volume | `Volume`, `Volm`, `PX_VOLUME` | Number | No |
+| Open interest | `OpenInt`, `Open Int`, `OI`, `OPEN_INT` | Number | No |
+| Implied vol | `IVM`, `IV Mid`, `Imp Vol`, `IVOL_MID` | Vol points: `20.5` means 20.5% | No |
+| Contract | `Ticker`, `Contract`, `Security` | Text | No |
+
+What to export: calls and puts on one underlying, all strikes within about 30% of the forward, on several expiries, during US market hours. Each expiry needs at least 5 strikes quoted on both sides, and strikes near the forward matter most for the parity fit. Note the time of the export, since `quote_time` needs it. A time with no zone is read as New York time.
+
+Options for other layouts:
+
+- `column_map={"Your Header": "strike"}` for an unrecognised header
+- `sep=";"` for a semicolon-separated file
+- `date_format="%d/%m/%Y"` for day-first dates
+
+A file that does not fit raises `BloombergFormatError`, which names the column and the value at fault. A decimal comma such as `12,50` is rejected on purpose: reading it as 1250 would corrupt the smile with no warning. Keep exports in `data/bloomberg/`, which git ignores, because Bloomberg data is licensed.
 
 ## Possible improvements
 

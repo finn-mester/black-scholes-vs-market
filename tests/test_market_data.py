@@ -4,6 +4,8 @@ Pricing a synthetic chain with known inputs means the right answer is known
 exactly, so each step of the pipeline can be checked against it.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -252,6 +254,126 @@ def test_bloomberg_csv_rejects_unknown_option_types(tmp_path):
     ).to_csv(path, index=False)
     with pytest.raises(ValueError, match="option_type"):
         load_bloomberg_csv(path, "2027-03-18")
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "bloomberg_example.csv"
+
+
+def test_documented_example_file_loads_and_gives_a_smile():
+    quotes = load_bloomberg_csv(FIXTURE, quote_time="2027-03-18 15:00", spot=4975.0, underlying="TEST Index")
+    assert quotes["expiry"].nunique() == 2
+    assert set(quotes["option_type"]) == {"call", "put"}
+    assert quotes["vendor_iv"].between(0.05, 0.60).all()  # Points converted to fractions.
+    assert quotes["contract"].iloc[0].startswith("TEST")
+    smile = build_smile(quotes)
+    assert len(smile) >= 10
+    assert smile["forward"].iloc[0] == pytest.approx(5000.0, abs=1.0)
+    expected = 0.20 - 0.30 * np.log(smile["strike"] / 5000.0)
+    np.testing.assert_allclose(smile["iv"], expected, atol=0.01)
+
+
+def write_rows(path, header: str, *rows: str) -> None:
+    path.write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+
+
+HEADER = "Expiry,Strike,Type,Bid,Ask"
+QUOTE_TIME_TEXT = "2027-03-18 15:00"
+
+
+@pytest.mark.parametrize(
+    "header, rows, kwargs, message",
+    [
+        pytest.param("Expiry;Strike;Type;Bid;Ask", ["06/18/2027;100;C;1;2"], {}, "separator", id="wrong-separator"),
+        pytest.param("Bloomberg report\n" + HEADER, ["06/18/2027,100,C,1,2"], {}, "title lines", id="title-line"),
+        pytest.param(HEADER, [], {}, "no data rows", id="no-rows"),
+        pytest.param("Expiry,Strike,Type,Bid", ["06/18/2027,100,C,1"], {}, r"Missing columns \['ask'\]", id="missing-column"),
+        pytest.param(HEADER, ['06/18/2027,100,C,"12,50",13'], {}, "Column 'bid'.*'12,50'", id="decimal-comma"),
+        pytest.param(HEADER, ["06/18/2027,abc,C,1,2"], {}, "Column 'strike'", id="text-strike"),
+        pytest.param(HEADER, ["06/18/2027,,C,1,2"], {}, "positive strike", id="blank-strike"),
+        pytest.param(HEADER, ["06/18/2027,100,Cash,1,2"], {}, "cash", id="unknown-type"),
+        pytest.param(HEADER, ["18/06/2027,100,C,1,2"], {}, "day-first", id="day-first-date"),
+        pytest.param(HEADER, ["June 2027,100,C,1,2"], {}, "expiry dates", id="unreadable-date"),
+        pytest.param(HEADER, ["06/18/2026,100,C,1,2"], {}, "not after quote_time", id="expired"),
+        pytest.param(HEADER, ["06/18/2027,100,C,1,2", "06/18/2027,100,C,1,2"], {}, "appear twice", id="duplicates"),
+        pytest.param(HEADER, ["06/18/2027,100,C,1,2"], {"column_map": {"Nope": "strike"}}, "column_map names", id="map-header"),
+        pytest.param(HEADER, ["06/18/2027,100,C,1,2"], {"column_map": {"Bid": "price"}}, "column_map targets", id="map-target"),
+    ],
+)
+def test_bloomberg_format_problems_are_explained(tmp_path, header, rows, kwargs, message):
+    path = tmp_path / "bbg.csv"
+    write_rows(path, header, *rows)
+    with pytest.raises(md.BloombergFormatError, match=message):
+        load_bloomberg_csv(path, QUOTE_TIME_TEXT, **kwargs)
+
+
+def test_bloomberg_empty_file_is_explained(tmp_path):
+    path = tmp_path / "bbg.csv"
+    path.write_text("")
+    with pytest.raises(md.BloombergFormatError, match="is empty"):
+        load_bloomberg_csv(path, QUOTE_TIME_TEXT)
+
+
+def test_bloomberg_wrong_encoding_is_explained(tmp_path):
+    path = tmp_path / "bbg.csv"
+    path.write_bytes(f"{HEADER}\n".encode("utf-16"))
+    with pytest.raises(md.BloombergFormatError, match="UTF-8"):
+        load_bloomberg_csv(path, QUOTE_TIME_TEXT)
+
+
+def test_bloomberg_unreadable_quote_time_is_explained(tmp_path):
+    path = tmp_path / "bbg.csv"
+    write_rows(path, HEADER, "06/18/2027,100,C,1,2")
+    with pytest.raises(md.BloombergFormatError, match="quote_time"):
+        load_bloomberg_csv(path, "not a time")
+
+
+def test_bloomberg_error_is_a_value_error_so_callers_can_catch_either(tmp_path):
+    assert issubclass(md.BloombergFormatError, ValueError)
+
+
+def test_bloomberg_accepts_a_semicolon_separator(tmp_path):
+    path = tmp_path / "bbg.csv"
+    write_rows(path, "Expiry;Strike;Type;Bid;Ask", "06/18/2027;100;C;1;2")
+    assert load_bloomberg_csv(path, QUOTE_TIME_TEXT, sep=";")["strike"].iloc[0] == 100.0
+
+
+def test_bloomberg_accepts_a_day_first_format_when_told(tmp_path):
+    path = tmp_path / "bbg.csv"
+    write_rows(path, HEADER, "18/06/2027,100,C,1,2")
+    quotes = load_bloomberg_csv(path, QUOTE_TIME_TEXT, date_format="%d/%m/%Y")
+    assert quotes["expiry"].iloc[0] == EXPIRY
+
+
+@pytest.mark.parametrize("text", ["06/18/2027", "06/18/27", "2027-06-18"])
+def test_bloomberg_accepts_the_documented_date_formats(tmp_path, text):
+    path = tmp_path / "bbg.csv"
+    write_rows(path, HEADER, f"{text},100,C,1,2")
+    assert load_bloomberg_csv(path, QUOTE_TIME_TEXT)["expiry"].iloc[0] == EXPIRY
+
+
+def test_bloomberg_excel_byte_order_mark_is_ignored(tmp_path):
+    path = tmp_path / "bbg.csv"
+    path.write_bytes(f"{HEADER}\n06/18/2027,100,C,1,2\n".encode("utf-8-sig"))
+    assert load_bloomberg_csv(path, QUOTE_TIME_TEXT)["expiry"].notna().all()
+
+
+def test_bloomberg_blank_quotes_mean_no_quote_rather_than_an_error(tmp_path):
+    path = tmp_path / "bbg.csv"
+    write_rows(path, HEADER, "06/18/2027,100,C,,#N/A N/A", "06/18/2027,110,C,-,N/A")
+    quotes = load_bloomberg_csv(path, QUOTE_TIME_TEXT)
+    assert quotes["bid"].isna().all() and quotes["ask"].isna().all()
+
+
+def test_bloomberg_field_mnemonics_are_recognised(tmp_path):
+    path = tmp_path / "bbg.csv"
+    write_rows(
+        path,
+        "OPT_EXPIRE_DT,OPT_STRIKE_PX,OPT_PUT_CALL,PX_BID,PX_ASK,PX_LAST,PX_VOLUME,OPEN_INT,IVOL_MID",
+        "2027-06-18,100,Put,1,2,1.5,3,4,20",
+    )
+    row = load_bloomberg_csv(path, QUOTE_TIME_TEXT).iloc[0]
+    assert (row["strike"], row["option_type"], row["last"], row["volume"]) == (100.0, "put", 1.5, 3.0)
+    assert row["open_interest"] == 4.0 and row["vendor_iv"] == pytest.approx(0.20)
 
 
 def test_nearest_expiries_never_repeat():

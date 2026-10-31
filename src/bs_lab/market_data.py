@@ -6,6 +6,10 @@ Snapshots are saved to CSV because a live option chain cannot be downloaded
 again later. They stay on the local machine: Yahoo's terms cover personal use,
 so raw quotes are not published with this repository.
 
+Bloomberg CSV loader – tested on synthetic files only, not yet validated on a
+real terminal export. `load_bloomberg_csv` documents the expected format, and
+tests/fixtures/bloomberg_example.csv shows it on made-up prices.
+
 From quotes to a smile
 ----------------------
 1. Use bid and ask only. The last trade can be days old.
@@ -52,7 +56,8 @@ MARKET_TIMEZONE = "America/New_York"
 SNAPSHOT_TICKER = "^SPX"
 TREASURY_TICKERS = {"^IRX": "13-week T-bill", "^FVX": "5-year Treasury"}
 
-# Spelling variants accepted in a Bloomberg export, lower-cased.
+# Spelling variants accepted in a Bloomberg export, lower-cased. The upper-case
+# field mnemonics should be confirmed on a terminal: none has been checked on one.
 BLOOMBERG_ALIASES = {
     "expiry": ["expiry", "exp", "expiration", "expiration date", "expiry date", "opt_expire_dt"],
     "strike": ["strike", "strike px", "strike price", "opt_strike_px"],
@@ -65,6 +70,9 @@ BLOOMBERG_ALIASES = {
     "vendor_iv": ["vendor_iv", "ivm", "iv mid", "imp vol", "ivol_mid"],
     "contract": ["contract", "ticker", "security"],
 }
+BLOOMBERG_REQUIRED = {"expiry", "strike", "option_type", "bid", "ask"}
+BLOOMBERG_EXPIRY_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d")
+BLOOMBERG_OPTION_TYPES = {"c": "call", "call": "call", "p": "put", "put": "put"}
 
 
 def _nearest_expiries(listed: Sequence[str], target_days: Sequence[int], today: pd.Timestamp) -> list[str]:
@@ -145,6 +153,87 @@ def load_chain(path: str | Path) -> pd.DataFrame:
     return quotes[CHAIN_COLUMNS]
 
 
+class BloombergFormatError(ValueError):
+    """A Bloomberg export does not match the format `load_bloomberg_csv` expects."""
+
+
+def _read_bloomberg_table(path: str | Path, sep: str) -> pd.DataFrame:
+    """Read every cell as text, so that parsing problems can be reported precisely."""
+    try:
+        # utf-8-sig also accepts the invisible marker Excel adds to "CSV UTF-8" files.
+        raw = pd.read_csv(path, sep=sep, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except pd.errors.EmptyDataError as error:
+        raise BloombergFormatError(f"{path} is empty") from error
+    except pd.errors.ParserError as error:
+        raise BloombergFormatError(
+            f"{path} has rows of different lengths. Remove any title lines above the "
+            f"header row. Parser message: {error}"
+        ) from error
+    except UnicodeDecodeError as error:
+        raise BloombergFormatError(f"{path} is not UTF-8 text. Save it again as CSV UTF-8.") from error
+    if raw.shape[1] < 2:
+        raise BloombergFormatError(
+            f"Found a single column ({list(raw.columns)}). Either the separator is not {sep!r} "
+            "(pass it with sep, for example sep=';'), or title lines sit above the header row."
+        )
+    if raw.empty:
+        raise BloombergFormatError(f"{path} has a header row but no data rows")
+    return raw
+
+
+def _rename_bloomberg_columns(raw: pd.DataFrame, column_map: Mapping[str, str] | None) -> pd.DataFrame:
+    """Map the file's headers onto the chain's column names."""
+    renames = dict(column_map or {})
+    unknown_headers = set(renames) - set(raw.columns)
+    if unknown_headers:
+        raise BloombergFormatError(f"column_map names {sorted(unknown_headers)}, not in {list(raw.columns)}")
+    unknown_targets = set(renames.values()) - set(BLOOMBERG_ALIASES)
+    if unknown_targets:
+        raise BloombergFormatError(
+            f"column_map targets {sorted(unknown_targets)} are unknown; use {sorted(BLOOMBERG_ALIASES)}"
+        )
+    for canonical, aliases in BLOOMBERG_ALIASES.items():
+        for column in raw.columns:
+            if column.strip().lower() in aliases and canonical not in renames.values():
+                renames[column] = canonical
+    return raw.rename(columns=renames)
+
+
+def _parse_numbers(values: pd.Series, column: str, strict: bool) -> pd.Series:
+    """Convert text to numbers, accepting 1,234.50 and treating blanks as missing.
+
+    Only commas in thousands position are removed: a decimal comma such as 12,50
+    must fail loudly, not silently become 1250.
+    """
+    text = values.astype(str).str.strip()
+    lowered = text.str.lower()
+    blank = lowered.isin(["", "nan", "n/a", "na", "-", "--"]) | lowered.str.startswith("#n/a")
+    has_thousands = text.str.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?")
+    cleaned = text.where(~has_thousands, text.str.replace(",", "", regex=False))
+    numbers = pd.to_numeric(cleaned.where(~blank), errors="coerce")
+    invalid = numbers.isna() & ~blank
+    if strict and invalid.any():
+        raise BloombergFormatError(
+            f"Column '{column}' has {int(invalid.sum())} value(s) that are not numbers, for "
+            f"example {text[invalid].iloc[0]!r}. Expected a format like 1234.50 or 1,234.50."
+        )
+    return numbers
+
+
+def _parse_expiries(values: pd.Series, date_format: str | None) -> pd.Series:
+    """Parse expiry dates, requiring one format across the whole column."""
+    text = values.astype(str).str.strip()
+    formats = (date_format,) if date_format else BLOOMBERG_EXPIRY_FORMATS
+    for candidate in formats:
+        parsed = pd.to_datetime(text, format=candidate, errors="coerce")
+        if parsed.notna().all():
+            return parsed
+    raise BloombergFormatError(
+        f"Could not read expiry dates such as {text.iloc[0]!r} with {list(formats)}. "
+        "For a day-first file pass date_format='%d/%m/%Y'."
+    )
+
+
 def load_bloomberg_csv(
     path: str | Path,
     quote_time: str | pd.Timestamp,
@@ -152,49 +241,79 @@ def load_bloomberg_csv(
     underlying: str = "",
     expiry: str | None = None,
     column_map: Mapping[str, str] | None = None,
+    sep: str = ",",
+    date_format: str | None = None,
 ) -> pd.DataFrame:
     """Load a Bloomberg export with one row per contract into the chain format.
 
-    Required: strike, bid, ask, the option type (C/P or call/put) and the expiry
-    (a column, or the `expiry` argument for a single-expiry export). Common
-    Bloomberg names are recognised through BLOOMBERG_ALIASES. Layouts vary with
-    the screen and template, so pass `column_map={"Your Header": "strike"}` for
-    anything else. This loader was tested on synthetic files in this layout,
-    not on a real terminal export. A side-by-side OMON layout must first be
-    reshaped to one row per contract.
+    Bloomberg CSV loader – tested on synthetic files only, not yet validated on
+    a real terminal export. tests/fixtures/bloomberg_example.csv is a reference.
+
+    File layout: UTF-8 text, comma-separated (see `sep`), with the header on the
+    first line and no title lines above it. One underlying, one row per contract.
+    A side-by-side OMON layout must first be reshaped to this form.
+
+    Required columns, matched without regard to case (see BLOOMBERG_ALIASES):
+    - expiry: MM/DD/YYYY, MM/DD/YY or YYYY-MM-DD, or any `date_format`. For a
+      single-expiry file it can be omitted and given in the `expiry` argument.
+    - strike: a number such as 4500.00 or 4,500.00.
+    - option type: C, P, Call or Put.
+    - bid and ask: numbers. Blank, N/A, #N/A and - count as no quote.
+
+    Optional columns: last, volume, open interest, contract name, and implied
+    vol in points (20.5 means 20.5%). Use `column_map={"Your Header": "strike"}`
+    for any header that is not recognised.
 
     `quote_time` should be when the quotes were taken; a time with no zone is
-    read as New York time.
+    read as New York time. A file that does not follow this format raises
+    BloombergFormatError, which says what was found and how to fix it.
     """
-    raw = pd.read_csv(path)
-    renames = dict(column_map or {})
-    for canonical, aliases in BLOOMBERG_ALIASES.items():
-        for column in raw.columns:
-            if column.strip().lower() in aliases and canonical not in renames.values():
-                renames[column] = canonical
-    quotes = raw.rename(columns=renames)
-
+    quotes = _rename_bloomberg_columns(_read_bloomberg_table(path, sep), column_map)
     if expiry is not None:
         quotes["expiry"] = expiry
-    missing = {"expiry", "strike", "option_type", "bid", "ask"} - set(quotes.columns)
+    missing = BLOOMBERG_REQUIRED - set(quotes.columns)
     if missing:
-        raise ValueError(f"Missing columns {sorted(missing)}; found {list(raw.columns)}")
+        raise BloombergFormatError(
+            f"Missing columns {sorted(missing)}; found {list(quotes.columns)}. "
+            "Rename them in the file or pass column_map={'Your Header': 'strike'}."
+        )
 
-    for column in ("strike", "bid", "ask", "last", "volume", "open_interest", "vendor_iv"):
+    for column in ("strike", "bid", "ask"):
+        quotes[column] = _parse_numbers(quotes[column], column, strict=True)
+    for column in ("last", "volume", "open_interest", "vendor_iv"):
         if column in quotes:
-            cleaned = quotes[column].astype(str).str.replace(",", "", regex=False)
-            quotes[column] = pd.to_numeric(cleaned, errors="coerce")
+            quotes[column] = _parse_numbers(quotes[column], column, strict=False)
+    if not (quotes["strike"] > 0).all():
+        raise BloombergFormatError("Every row needs a strictly positive strike")
 
-    first_letter = quotes["option_type"].astype(str).str.strip().str.upper().str[0]
-    quotes["option_type"] = first_letter.map({"C": "call", "P": "put"})
-    if quotes["option_type"].isna().any():
-        raise ValueError("option_type must contain C/P or call/put")
+    labels = quotes["option_type"].astype(str).str.strip().str.lower()
+    quotes["option_type"] = labels.map(BLOOMBERG_OPTION_TYPES)
+    unknown = sorted(set(labels[quotes["option_type"].isna()]))
+    if unknown:
+        raise BloombergFormatError(f"option_type must be C, P, Call or Put; found {unknown[:5]}")
 
-    timestamp = pd.Timestamp(quote_time)
+    quotes["expiry"] = _parse_expiries(quotes["expiry"], date_format)
+    if quotes.duplicated(["expiry", "strike", "option_type"]).any():
+        raise BloombergFormatError(
+            "Some contracts appear twice with the same expiry, strike and type. Keep one "
+            "root per file: SPX and SPXW options can share all three."
+        )
+
+    try:
+        timestamp = pd.Timestamp(quote_time)
+    except ValueError as error:
+        raise BloombergFormatError(f"Could not read quote_time {quote_time!r}") from error
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize(MARKET_TIMEZONE)
-    quotes["quote_time"] = timestamp.tz_convert("UTC")
-    quotes["expiry"] = pd.to_datetime(quotes["expiry"])
+    timestamp = timestamp.tz_convert("UTC")
+    first_expiry = quotes["expiry"].min()
+    if year_fraction(first_expiry, timestamp) <= 0:
+        raise BloombergFormatError(
+            f"Expiry {first_expiry.date()} is not after quote_time {timestamp}. Check quote_time "
+            "and whether the dates are day-first."
+        )
+
+    quotes["quote_time"] = timestamp
     quotes["underlying"] = underlying
     quotes["spot"] = spot
     if "vendor_iv" in quotes:
