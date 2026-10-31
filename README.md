@@ -178,3 +178,7 @@ A file that does not fit raises `BloombergFormatError`, which names the column a
 - **Simulate delta hedging** to measure the profit and loss when volatility or jumps depart from the model.
 - **Use Bloomberg data** to compare timestamped quotes with the Yahoo results.
 - **Extend to American underlyings** by using the tree to back out implied vols on single stocks.
+
+## License
+
+MIT. See [LICENSE](LICENSE). The license covers the code, not market data.
