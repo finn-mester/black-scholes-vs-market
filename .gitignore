@@ -8,3 +8,9 @@ __pycache__/
 
 # Bloomberg data is licensed: keep exports out of the repository.
 data/bloomberg/
+
+# Yahoo quotes are for personal use: keep raw snapshots local.
+data/*.csv
+
+# Charts from a fresh download differ from the reference results.
+figures/live/

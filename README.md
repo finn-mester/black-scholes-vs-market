@@ -10,7 +10,7 @@ No pricing library is used. Everything is implemented with numpy, and `scipy.sta
 
 ## Key results
 
-Market figures come from one snapshot of `^SPX` options taken on 2026-10-30 at 18:44 UTC, a day the index fell 2.36%. All numbers can be reproduced from `notebooks/analysis.ipynb`.
+Market figures come from one snapshot of `^SPX` options taken on 2026-10-30 at 18:44 UTC, a day the index fell 2.36%. The raw quotes are not published, because Yahoo's terms cover personal use. The saved outputs of `notebooks/analysis.ipynb` are the record of that run.
 
 **1. The constant-volatility assumption fails, by a wide margin.** At 1 month, implied vol runs from about 13% at the 108% strike to about 30% at the 90% strike. The skew is at least 3.7 vol points at every maturity, against a median bid-ask width of 0.11, so it is not noise.
 
@@ -23,7 +23,7 @@ Market figures come from one snapshot of `^SPX` options taken on 2026-10-30 at 1
 | 6 months | 16.9% | 22.4% | 5.6 | 2.0x |
 | 1 year | 17.5% | 21.2% | 3.7 | 1.4x |
 
-A 1-month put 10% out of the money would be worth 2.65 index points at the at-the-money vol. Multiples overstate the gap, because far-from-the-money prices are very convex in vol, so the vol points are the fairer comparison.
+A 1-month put 10% out of the money costs about 12 times its price at the at-the-money vol. Multiples overstate the gap, because far-from-the-money prices are very convex in vol, so the vol points are the fairer comparison.
 
 **2. History contradicts the same assumptions.** Over 10 years of daily S&P 500 returns there were 17 moves beyond 4 standard deviations, where a normal distribution predicts 0.16. The 21-day realised vol ranged from 3% to 98%.
 
@@ -82,6 +82,7 @@ Each assumption, and what this project measured about it:
 The evidence itself has limits:
 
 - **One snapshot, on a stressed day.** The skew may be steeper than usual, and nothing here shows how it behaves over time.
+- **Not exactly reproducible.** The quotes behind the market results are not in this repository, and a past option chain cannot be downloaded again. A new run uses new quotes and gives different numbers.
 - **Delayed quotes.** Yahoo gives no exact time for each quote. The parity check removes the stale quotes it can detect, but it cannot show that the rest are simultaneous.
 - **Implied rates are not Treasury rates.** The 3-month implied rate is 52 bp above the 13-week T-bill yield of 3.97%. This is probably a funding spread, which this project did not test. The short-dated rate is also noisy.
 - **Crash risk is an interpretation.** The data shows the skew exists, but it does not separate crash risk from demand for hedging.
@@ -99,11 +100,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Reproduce all results and figures. This reads the saved snapshot in `data/` and needs no network access:
+Run the notebook:
 
 ```bash
 jupyter nbconvert --to notebook --execute --inplace notebooks/analysis.ipynb
 ```
+
+The pricing, Greeks, Monte Carlo, implied vol and tree sections need no data and give the same numbers on every run. The market section depends on what is available:
+
+| Situation | What the notebook does |
+|---|---|
+| Reference snapshot in `data/` (author's machine only) | Reproduces the published results. |
+| Snapshot absent, US market open | Downloads current quotes, warns that the numbers differ from this README, and writes its charts to `figures/live/`. The published figures are left untouched. |
+| Download fails, or market closed (Yahoo's bids are then empty) | Says so, skips the market cells and shows the published figures. |
+
+A rerun replaces the saved outputs in the notebook, so do not commit one made with different data.
 
 ## Running the tests
 

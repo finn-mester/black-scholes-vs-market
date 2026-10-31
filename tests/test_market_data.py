@@ -18,6 +18,7 @@ from bs_lab.market_data import (
     parity_misses,
     load_bloomberg_csv,
     load_chain,
+    obtain_snapshot,
     return_statistics,
     save_chain,
     term_summary,
@@ -293,6 +294,78 @@ def test_fetch_option_chain_normalises_yahoo_columns(monkeypatch):
     assert list(quotes.columns) == md.CHAIN_COLUMNS
     assert sorted(quotes["option_type"]) == ["call", "put"]
     assert quotes["spot"].iloc[0] == 101.0
+
+
+def write_snapshot(folder, date: str) -> None:
+    chain = make_chain()
+    chain["quote_time"] = chain["quote_time"].dt.tz_convert("UTC")
+    save_chain(chain, folder / f"spx_options_{date}.csv")
+    pd.Series([1.0, 2.0], index=pd.to_datetime(["2027-03-17", "2027-03-18"]), name="close").to_csv(
+        folder / f"spx_daily_close_{date}.csv"
+    )
+    pd.DataFrame({"ticker": ["^IRX"], "tenor": ["13-week T-bill"], "yield_pct": [4.0], "date": [date]}).to_csv(
+        folder / f"treasury_yields_{date}.csv", index=False
+    )
+
+
+def fail_if_called(*args, **kwargs):
+    raise AssertionError("The network must not be used")
+
+
+def stub_download(monkeypatch, chain: pd.DataFrame) -> None:
+    close = pd.Series([1.0, 2.0], index=pd.to_datetime(["2027-03-17", "2027-03-18"]), name="close")
+    treasuries = pd.DataFrame({"ticker": ["^IRX"], "tenor": ["t"], "yield_pct": [4.0], "date": ["d"]})
+    monkeypatch.setattr(md, "fetch_option_chain", lambda ticker: chain)
+    monkeypatch.setattr(md, "fetch_price_history", lambda ticker: close)
+    monkeypatch.setattr(md, "fetch_treasury_yields", lambda date: treasuries)
+
+
+def utc_chain() -> pd.DataFrame:
+    chain = make_chain()
+    chain["quote_time"] = chain["quote_time"].dt.tz_convert("UTC")
+    return chain
+
+
+def test_saved_reference_snapshot_is_used_without_the_network(tmp_path, monkeypatch):
+    write_snapshot(tmp_path, "2026-10-30")
+    monkeypatch.setattr(md, "fetch_option_chain", fail_if_called)
+    snapshot = obtain_snapshot(tmp_path, "2026-10-30")
+    assert snapshot.date == "2026-10-30" and not snapshot.downloaded
+    assert len(snapshot.quotes) == len(make_chain())
+
+
+def test_partial_snapshot_triggers_a_download(tmp_path, monkeypatch):
+    write_snapshot(tmp_path, "2026-10-30")
+    (tmp_path / "treasury_yields_2026-10-30.csv").unlink()
+    stub_download(monkeypatch, utc_chain())
+    assert obtain_snapshot(tmp_path, "2026-10-30").downloaded
+
+
+def test_missing_snapshot_is_downloaded_and_saved_locally(tmp_path, monkeypatch):
+    stub_download(monkeypatch, utc_chain())
+    data_dir = tmp_path / "new_folder"
+    snapshot = obtain_snapshot(data_dir, "2026-10-30")
+    assert snapshot.downloaded and snapshot.date != "2026-10-30"
+    assert len(list(data_dir.glob("*.csv"))) == 3
+    assert build_smile(snapshot.quotes)["iv"].mean() == pytest.approx(0.2, abs=1e-3)
+
+
+def test_failed_download_raises_a_clear_error_and_saves_nothing(tmp_path, monkeypatch):
+    def no_network(ticker):
+        raise ConnectionError("no route to host")
+
+    monkeypatch.setattr(md, "fetch_option_chain", no_network)
+    with pytest.raises(md.MarketDataUnavailable, match="ConnectionError: no route to host"):
+        obtain_snapshot(tmp_path, "2026-10-30")
+    assert list(tmp_path.glob("*.csv")) == []
+
+
+def test_unusable_quotes_count_as_unavailable(tmp_path, monkeypatch):
+    """With the market closed, Yahoo can return a chain whose bids are all zero."""
+    stub_download(monkeypatch, utc_chain().assign(bid=0.0, ask=0.0))
+    with pytest.raises(md.MarketDataUnavailable, match="ValueError"):
+        obtain_snapshot(tmp_path, "2026-10-30")
+    assert list(tmp_path.glob("*.csv")) == []
 
 
 def test_return_statistics_see_nothing_unusual_in_gaussian_returns():

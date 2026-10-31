@@ -3,7 +3,8 @@
 Both sources, Yahoo Finance and a Bloomberg CSV export, produce the same table
 (CHAIN_COLUMNS), so the analysis code does not care where quotes came from.
 Snapshots are saved to CSV because a live option chain cannot be downloaded
-again later: results stay reproducible only if the exact quotes are kept.
+again later. They stay on the local machine: Yahoo's terms cover personal use,
+so raw quotes are not published with this repository.
 
 From quotes to a smile
 ----------------------
@@ -20,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -47,6 +49,8 @@ CHAIN_COLUMNS = [
 ]
 
 MARKET_TIMEZONE = "America/New_York"
+SNAPSHOT_TICKER = "^SPX"
+TREASURY_TICKERS = {"^IRX": "13-week T-bill", "^FVX": "5-year Treasury"}
 
 # Spelling variants accepted in a Bloomberg export, lower-cased.
 BLOOMBERG_ALIASES = {
@@ -111,6 +115,20 @@ def fetch_price_history(ticker: str, period: str = "10y") -> pd.Series:
     close.index = close.index.tz_localize(None).normalize()
     close.name = "close"
     return close
+
+
+def fetch_treasury_yields(date: str) -> pd.DataFrame:
+    """Download the latest Treasury yields, used to sanity-check implied rates."""
+    rows = [
+        {
+            "ticker": ticker,
+            "tenor": tenor,
+            "yield_pct": round(float(yf.Ticker(ticker).history(period="5d")["Close"].iloc[-1]), 3),
+            "date": date,
+        }
+        for ticker, tenor in TREASURY_TICKERS.items()
+    ]
+    return pd.DataFrame(rows)
 
 
 def save_chain(quotes: pd.DataFrame, path: str | Path) -> None:
@@ -185,6 +203,70 @@ def load_bloomberg_csv(
         if column not in quotes:
             quotes[column] = pd.NaT if column == "last_trade" else np.nan
     return quotes[CHAIN_COLUMNS]
+
+
+class MarketDataUnavailable(RuntimeError):
+    """No saved snapshot exists and a usable one could not be downloaded."""
+
+
+@dataclass(frozen=True)
+class MarketSnapshot:
+    """Everything the market analysis needs, taken on one date."""
+
+    date: str
+    quotes: pd.DataFrame
+    close: pd.Series
+    treasuries: pd.DataFrame
+    downloaded: bool
+
+
+def _snapshot_paths(data_dir: Path, date: str) -> dict[str, Path]:
+    return {
+        "quotes": data_dir / f"spx_options_{date}.csv",
+        "close": data_dir / f"spx_daily_close_{date}.csv",
+        "treasuries": data_dir / f"treasury_yields_{date}.csv",
+    }
+
+
+def _download_snapshot(data_dir: Path) -> MarketSnapshot:
+    """Download a snapshot, check it can produce a smile, then save it locally."""
+    date = datetime.now(timezone.utc).date().isoformat()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # yfinance emits pandas deprecation notices.
+        quotes = fetch_option_chain(SNAPSHOT_TICKER)
+        close = fetch_price_history(SNAPSHOT_TICKER)
+        treasuries = fetch_treasury_yields(date)
+    build_smile(quotes)  # With the market closed, quotes can be empty or all zero.
+
+    paths = _snapshot_paths(data_dir, date)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    save_chain(quotes, paths["quotes"])
+    close.to_csv(paths["close"])
+    treasuries.to_csv(paths["treasuries"], index=False)
+    return MarketSnapshot(date, load_chain(paths["quotes"]), close, treasuries, downloaded=True)
+
+
+def obtain_snapshot(data_dir: str | Path, reference_date: str) -> MarketSnapshot:
+    """Read the reference snapshot if it is here, otherwise download a new one.
+
+    A downloaded snapshot holds different quotes from the reference, so its
+    results will not match the README. Raises MarketDataUnavailable if the
+    download fails or returns quotes that cannot produce a smile.
+    """
+    data_dir = Path(data_dir)
+    paths = _snapshot_paths(data_dir, reference_date)
+    if all(path.exists() for path in paths.values()):
+        close = pd.read_csv(paths["close"], index_col=0, parse_dates=True)["close"]
+        treasuries = pd.read_csv(paths["treasuries"])
+        return MarketSnapshot(reference_date, load_chain(paths["quotes"]), close, treasuries, downloaded=False)
+    try:
+        return _download_snapshot(data_dir)
+    except Exception as error:  # yfinance raises many types: network, parsing, empty data.
+        raise MarketDataUnavailable(
+            "Could not download usable quotes. This needs network access and US market "
+            f"hours, because Yahoo's bids are empty when the market is closed. "
+            f"Cause: {type(error).__name__}: {error}"
+        ) from error
 
 
 def year_fraction(expiry: pd.Timestamp, quote_time: pd.Timestamp) -> float:
