@@ -126,6 +126,8 @@ The 179 tests run in under a minute, on synthetic data, with no network access.
 
 ## Using your own data
 
+Market data sourced from Yahoo Finance for educational, non-commercial purposes; raw data is not redistributed.
+
 ```python
 from bs_lab.market_data import build_smile, fetch_option_chain, load_bloomberg_csv, save_chain
 
