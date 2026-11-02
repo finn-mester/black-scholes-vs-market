@@ -1,4 +1,4 @@
-# bs-options-lab
+# black-scholes-vs-market
 
 A from-scratch implementation of the Black-Scholes model, tested against real S&P 500 option quotes to find out where it holds and where it breaks.
 
@@ -94,7 +94,7 @@ Requires Python 3.11 or later. Developed and tested on Python 3.13.
 
 ```bash
 git clone <repository-url>
-cd bs-options-lab
+cd black-scholes-vs-market
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
